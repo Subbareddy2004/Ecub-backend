@@ -187,18 +187,18 @@ app.get('/api/orders/:userId', async (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
     try {
-        const { message, mealType } = req.body;
+        const { message, mealType, userLocation } = req.body;
 
         if (!message && !mealType) {
-            throw new Error('Message or meal type is required');
+            return res.status(400).json({ error: 'Message or meal type is required' });
         }
 
         // Fetch menu items from Firestore
-        const menuSnapshot = await db.collection('fs_food_items').get();
+        const menuSnapshot = await db.collection('fs_food_items1').get();
         const menu = menuSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
         // Process personalized recommendations
-        const recommendations = await getPersonalizedRecommendations(message, menu, mealType);
+        const recommendations = await getPersonalizedRecommendations(message, menu, mealType, userLocation);
 
         res.json({
             recommendations: recommendations
@@ -212,7 +212,7 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-async function getPersonalizedRecommendations(query, menu, mealType) {
+async function getPersonalizedRecommendations(query, menu, mealType, userLocation) {
     try {
         if (query) {
             // First, try to find exact matches
@@ -240,33 +240,63 @@ async function getPersonalizedRecommendations(query, menu, mealType) {
             prompt += `provide a list of 5 generally recommended items. `;
         }
         
-        prompt += `Format the response as a JSON array of objects with 'id' and 'relevance' properties, where 'relevance' is a number from 0 to 1 indicating how closely the item matches the query or meal type.`;
+        prompt += `Format the response as a JSON array of objects with 'id' and 'relevance' properties, where 'relevance' is a number from 0 to 1 indicating how closely the item matches the query or meal type. Do not include any additional text or formatting.`;
 
         const result = await model.generateContent(prompt);
         const content = result.response.text();
         console.log("Raw Gemini response for recommendations:", content);
 
-        // Remove markdown delimiters if present
-        const cleanedContent = content.replace(/```(json|JSON)\n|\n```/g, '').trim();
+        // Remove any non-JSON content
+        const jsonContent = content.replace(/^[\s\S]*?(\[[\s\S]*\])[\s\S]*$/, '$1');
 
-        let recommendedItems = JSON.parse(cleanedContent);
+        let recommendedItems;
+        try {
+            recommendedItems = JSON.parse(jsonContent);
+        } catch (parseError) {
+            console.error("Error parsing Gemini response:", parseError);
+            return [];
+        }
 
         // Sort items by relevance
         recommendedItems.sort((a, b) => b.relevance - a.relevance);
 
-        // Get full menu items for the recommended IDs
-        const recommendations = recommendedItems.map(item => 
-            menu.find(menuItem => menuItem.id === item.id)
-        ).filter(Boolean);
+        // Get full menu items for the recommended IDs and add hotel info
+        const recommendations = await Promise.all(recommendedItems.map(async item => {
+            const menuItem = menu.find(m => m.id === item.id);
+            if (!menuItem) return null;
 
-        return recommendations;
+            // Fetch hotel info
+            const hotelDoc = await db.collection('fs_hotels').doc(menuItem.productOwnership).get();
+            const hotelData = hotelDoc.exists ? hotelDoc.data() : null;
+
+            let distance = null;
+            if (hotelData && hotelData.latitude && hotelData.longitude && 
+                userLocation && userLocation.latitude && userLocation.longitude) {
+                try {
+                    distance = geolib.getDistance(
+                        { latitude: parseFloat(userLocation.latitude), longitude: parseFloat(userLocation.longitude) },
+                        { latitude: parseFloat(hotelData.latitude), longitude: parseFloat(hotelData.longitude) }
+                    ) / 1000; // Convert meters to kilometers
+                } catch (error) {
+                    console.error("Error calculating distance:", error);
+                }
+            }
+
+            return {
+                ...menuItem,
+                hotelName: hotelData ? hotelData.hotelName : menuItem.productOwnership,
+                distance: distance !== null ? Number(distance.toFixed(2)) : null
+            };
+        }));
+
+        console.log("Recommendations with distance:", recommendations);
+
+        return recommendations.filter(Boolean);
     } catch (error) {
         console.error("Error getting personalized recommendations:", error);
-        console.error("Cleaned content:", cleanedContent);
         return [];
     }
 }
-
 // Helper function to shuffle an array
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
@@ -290,7 +320,7 @@ app.get('/api/recommendations', async (req, res) => {
 
 app.get('/api/popular-items', async (req, res) => {
     try {
-        const popularItemsSnapshot = await db.collection('fs_food_items')
+        const popularItemsSnapshot = await db.collection('fs_food_items1')
         .where('productRating', '>=', 4.0)
             .orderBy('productRating', 'desc')
             .limit(5)
@@ -308,31 +338,46 @@ app.get('/api/popular-items', async (req, res) => {
 
 app.get('/api/personalized-recommendations', async (req, res) => {
     try {
-        const { query, mealType, lat, lon } = req.query;
+        const { query, mealType, latitude, longitude } = req.query;
+        console.log('Received request with query:', query, 'mealType:', mealType, 'lat:', latitude, 'lon:', longitude);
         
-        const menuSnapshot = await db.collection('fs_food_items').get();
+        const menuSnapshot = await db.collection('fs_food_items1').get();
         const menu = menuSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        console.log('Total menu items:', menu.length);
         
-        let recommendations = await getPersonalizedRecommendations(query, menu, mealType);
+        let recommendations = [];
 
-        // Add distance to each recommendation if user location is provided
-        if (lat && lon) {
-            const restaurantsSnapshot = await db.collection('fs_hotels').get();
-            const restaurants = restaurantsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-            
-            recommendations = recommendations.map(item => {
-                const restaurant = restaurants.find(r => r.id === item.restaurantId);
-                if (restaurant && restaurant.latitude && restaurant.longitude) {
-                    item.distance = calculateDistance(lat, lon, restaurant.latitude, restaurant.longitude);
-                }
-                return item;
-            });
+        if (query) {
+            recommendations = menu.filter(item => 
+                item.productTitle.toLowerCase().includes(query.toLowerCase()) ||
+                (item.productDesc && item.productDesc.toLowerCase().includes(query.toLowerCase()))
+            );
+        } else if (mealType) {
+            recommendations = menu.filter(item => 
+                item.foodAvailTime && item.foodAvailTime.toLowerCase() === mealType.toLowerCase()
+            );
         }
 
+        console.log('Filtered recommendations:', recommendations.length);
+
+        // If no matches found, return some random items
+        if (recommendations.length === 0) {
+            recommendations = menu.sort(() => 0.5 - Math.random()).slice(0, 5);
+            console.log('No matches found, returning random items');
+        }
+
+        // Limit to 5 recommendations
+        recommendations = recommendations.slice(0, 5);
+
+        // Fetch hotel info and calculate distances
+        const userLocation = latitude && longitude ? { latitude, longitude } : null;
+        recommendations = await getPersonalizedRecommendations(query, recommendations, mealType, userLocation);
+
+        console.log('Sending recommendations:', recommendations.map(item => item.productTitle));
         res.json(recommendations);
     } catch (error) {
         console.error("Error fetching personalized recommendations:", error);
-        res.status(500).json({ error: "Failed to fetch personalized recommendations" });
+        res.status(500).json({ error: "Failed to fetch personalized recommendations", details: error.message });
     }
 });
 
