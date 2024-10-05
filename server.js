@@ -12,7 +12,10 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(cors({
+  origin: ['https://ecub-bot3.vercel.app', 'http://localhost:5173'],
+  credentials: true
+}));
 app.use(bodyParser.json());
 
 // Initialize Firebase Admin SDK
